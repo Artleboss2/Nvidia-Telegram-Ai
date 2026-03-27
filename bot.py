@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from openai import OpenAI
 import telebot
 from telebot.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from PIL import Image
 
 try:
     import fitz
@@ -181,12 +182,12 @@ def handle_retry(call):
         call.message.from_user.id = call.from_user.id
         handle_message(call.message)
 
-@bot.message_handler(content_types=["document", "photo"])
+@bot.message_handler(content_types=["document", "photo", "voice", "audio"])
 def handle_files(message: Message):
     if not is_allowed(message.from_user.id): return
     if message.document:
         if not PDF_SUPPORT:
-            bot.reply_to(message, "L'analyse PDF est désactivée.")
+            bot.reply_to(message, "Analyse PDF désactivée.")
             return
         file_info = bot.get_file(message.document.file_id)
         downloaded = bot.download_file(file_info.file_path)
@@ -195,18 +196,24 @@ def handle_files(message: Message):
                 doc = fitz.open(stream=downloaded, filetype="pdf")
                 text = "".join([p.get_text() for p in doc])
                 doc.close()
-                message.text = f"[Analyse PDF]\n{text[:3000]}"
+                message.text = f"[Contenu PDF]\n{text[:3000]}"
                 handle_message(message)
             except: bot.reply_to(message, "Erreur PDF.")
     elif message.photo:
         file_info = bot.get_file(message.photo[-1].file_id)
         downloaded = bot.download_file(file_info.file_path)
-        b64 = base64.b64encode(downloaded).decode('utf-8')
+        img = Image.open(io.BytesIO(downloaded))
+        if img.mode != 'RGB': img = img.convert('RGB')
+        output = io.BytesIO()
+        img.save(output, format="JPEG", quality=85)
+        b64 = base64.b64encode(output.getvalue()).decode('utf-8')
         status = bot.send_message(message.chat.id, "Analyse image...")
         try:
-            res = call_nvidia_api("Expert Vision", [{"role":"user","content":[{"type":"text","text":"Décris l'image"},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}]}], VISION_MODEL_ID)
+            res = call_nvidia_api("Expert Vision", [{"role":"user","content":[{"type":"text","text":"Décris précisément cette image."},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}]}], VISION_MODEL_ID)
             bot.edit_message_text(res, message.chat.id, status.message_id)
-        except: bot.edit_message_text("Erreur vision (Modèle 404).", message.chat.id, status.message_id)
+        except: bot.edit_message_text("Erreur Vision API.", message.chat.id, status.message_id)
+    elif message.voice or message.audio:
+        bot.reply_to(message, "Transcription audio non configurée (Whisper requis).")
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_message(message: Message):
@@ -235,7 +242,7 @@ def handle_message(message: Message):
             conn.commit()
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Réessayer", callback_data=f"retry:{rid}"))
-        bot.edit_message_text(f"Erreur API. Vérifiez vos IDs NVIDIA.", message.chat.id, status_msg.message_id, reply_markup=markup)
+        bot.edit_message_text("Erreur API NVIDIA.", message.chat.id, status_msg.message_id, reply_markup=markup)
 
 if __name__ == "__main__":
     init_db()
