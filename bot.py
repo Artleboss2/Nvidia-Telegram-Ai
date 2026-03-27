@@ -4,6 +4,7 @@ import sqlite3
 import logging
 import time
 import threading
+import io
 from contextlib import contextmanager
 from openai import OpenAI
 import telebot
@@ -110,7 +111,7 @@ def call_nvidia_api(system_prompt: str, messages: list):
     return res.choices[0].message.content.strip()
 
 def animate_thinking(chat_id, message_id, stop_event):
-    frames = ["💭 Réflexion", "💭 Réflexion.", "💭 Réflexion..", "💭 Réflexion..."]
+    frames = ["Reflexion", "Reflexion.", "Reflexion..", "Reflexion..."]
     idx = 0
     while not stop_event.is_set():
         try:
@@ -123,7 +124,7 @@ def animate_thinking(chat_id, message_id, stop_event):
 @bot.message_handler(commands=["start"])
 def handle_start(message: Message):
     if not is_allowed(message.from_user.id): return
-    bot.send_message(message.chat.id, "⚡ *Assistant Rapide*\nPose-moi ta question.")
+    bot.send_message(message.chat.id, "Assistant Rapide\nJe peux maintenant lire tes fichiers texte et tes messages.")
 
 @bot.message_handler(commands=["reset"])
 def handle_reset(message: Message):
@@ -131,56 +132,66 @@ def handle_reset(message: Message):
     with get_db() as conn:
         conn.execute("DELETE FROM memory WHERE user_id = ?", (message.from_user.id,))
         conn.commit()
-    bot.send_message(message.chat.id, "🗑️ Mémoire et historique totalement effacés.")
+    bot.send_message(message.chat.id, "Memoire effacee.")
 
 @bot.message_handler(commands=["clear"])
 def handle_clear(message: Message):
     if not is_allowed(message.from_user.id): return
-    
-    status = bot.send_message(message.chat.id, "🧹 *Nettoyage de l'écran...*")
-    
-    # On tente de supprimer les 100 derniers messages (limite de sécurité)
+    status = bot.send_message(message.chat.id, "Nettoyage...")
     for i in range(message.message_id, message.message_id - 100, -1):
-        try:
-            bot.delete_message(message.chat.id, i)
-        except:
-            continue
-            
-    bot.edit_message_text(
-        chat_id=message.chat.id, 
-        message_id=status.message_id, 
-        text="✨ *Écran nettoyé !* (La mémoire est conservée)"
-    )
+        try: bot.delete_message(message.chat.id, i)
+        except: continue
+    bot.edit_message_text(chat_id=message.chat.id, message_id=status.message_id, text="Ecran nettoye !")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("retry:"))
 def handle_retry(call):
     retry_id = call.data.split(":")[1]
     with get_db() as conn:
         row = conn.execute("SELECT text FROM retry_cache WHERE msg_id = ?", (retry_id,)).fetchone()
-    
     if row:
         original_text = row["text"]
         msg = call.message
         msg.text = original_text
         msg.from_user.id = call.from_user.id
-        try:
-            bot.delete_message(chat_id=msg.chat.id, message_id=msg.message_id)
-        except:
-            pass
+        try: bot.delete_message(chat_id=msg.chat.id, message_id=msg.message_id)
+        except: pass
         handle_message(msg)
     else:
-        bot.answer_callback_query(call.id, "Désolé, impossible de récupérer le message.")
+        bot.answer_callback_query(call.id, "Erreur de recuperation.")
+
+@bot.message_handler(content_types=["document", "photo"])
+def handle_files(message: Message):
+    if not is_allowed(message.from_user.id): return
+    
+    uid = message.from_user.id
+    file_content = ""
+    file_name = ""
+
+    if message.document:
+        if message.document.mime_type and ("text" in message.document.mime_type or "application/json" in message.document.mime_type or "python" in message.document.mime_type):
+            file_info = bot.get_file(message.document.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            file_content = downloaded_file.decode('utf-8', errors='ignore')
+            file_name = message.document.file_name
+            prompt_text = f"Voici le contenu du fichier {file_name} :\n\n{file_content}\n\nQue dois-je faire avec ce fichier ?"
+            message.text = prompt_text
+            handle_message(message)
+        else:
+            bot.reply_to(message, "Desole, je ne peux lire que les fichiers texte ou de code pour le moment.")
+    
+    elif message.photo:
+        bot.reply_to(message, "J'ai bien recu ton image, mais ma fonction d'analyse d'image est en cours de maintenance. Envoie-moi du texte ou un fichier .txt !")
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_message(message: Message):
     if not is_allowed(message.from_user.id):
-        bot.send_message(message.chat.id, "🚫 Accès refusé.")
+        bot.send_message(message.chat.id, "Acces refuse.")
         return
     
     uid, txt = message.from_user.id, message.text.strip()
     bot.send_chat_action(message.chat.id, 'typing')
     
-    status_msg = bot.send_message(message.chat.id, "💭 *Réflexion*")
+    status_msg = bot.send_message(message.chat.id, "Reflexion")
     
     stop_anim = threading.Event()
     anim_thread = threading.Thread(target=animate_thinking, args=(message.chat.id, status_msg.message_id, stop_anim))
@@ -206,7 +217,7 @@ def handle_message(message: Message):
     except Exception as e:
         stop_anim.set()
         anim_thread.join()
-        log.error(f"Erreur/Timeout : {e}")
+        log.error(f"Erreur : {e}")
         
         retry_id = str(int(time.time()))
         with get_db() as conn:
@@ -214,17 +225,12 @@ def handle_message(message: Message):
             conn.commit()
 
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔄 Réessayer", callback_query_data=f"retry:{retry_id}"))
-        
-        error_txt = "⚠️ *Erreur : Délai dépassé ou service indisponible.*"
-        try:
-            bot.edit_message_text(chat_id=message.chat.id, message_id=status_msg.message_id, text=error_txt, reply_markup=markup, parse_mode="Markdown")
-        except:
-            pass
+        markup.add(InlineKeyboardButton("Reessayer", callback_query_data=f"retry:{retry_id}"))
+        bot.edit_message_text(chat_id=message.chat.id, message_id=status_msg.message_id, text="Delai depasse.", reply_markup=markup, parse_mode="Markdown")
 
 if __name__ == "__main__":
     init_db()
-    log.info(f"Démarrage : {MODEL_ID}")
+    log.info(f"Demarrage : {MODEL_ID}")
     while True:
         try:
             bot.infinity_polling(timeout=30)
