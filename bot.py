@@ -6,6 +6,7 @@ import time
 import threading
 import io
 import base64
+import re
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
@@ -24,7 +25,7 @@ log = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
-NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "[https://integrate.api.nvidia.com/v1](https://integrate.api.nvidia.com/v1)")
 VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "meta/llama-3.2-11b-vision-instruct")
 DB_PATH = os.getenv("DB_PATH", "/app/data/memory.db")
 
@@ -123,52 +124,71 @@ def call_nvidia_api(system_prompt: str, messages: list, model):
     res = nvidia_client.chat.completions.create(
         model=model,
         messages=payload,
-        temperature=0.6,
-        max_tokens=2048,
-        timeout=120
+        temperature=0.3, # Encore plus bas pour éviter les "fantaisies" de formatage
+        max_tokens=4096,
+        timeout=240      # 4 minutes max pour les gros projets
     )
     return res.choices[0].message.content.strip()
 
-def agent_worker(role_name, prompt, model_id):
+def agent_worker(role_name, prompt, model_id, context_info=""):
+    full_prompt = f"Expertise: {role_name}\nInfos de recherche: {context_info}\n\nMission: {prompt}"
     try:
-        return call_nvidia_api(f"Tu es l'expert {role_name}. Réponds uniquement avec le code ou les données demandées.", [{"role": "user", "content": prompt}], model_id)
+        return call_nvidia_api(f"Tu es l'expert {role_name}. Produis un code robuste et complet.", [{"role": "user", "content": full_prompt}], model_id)
     except Exception as e:
         return f"Erreur {role_name}: {str(e)}"
 
+def clean_markdown(text):
+    """Supprime les balises ```html et ``` au début et à la fin."""
+    text = re.sub(r'^```[a-z]*\n', '', text, flags=re.MULTILINE)
+    text = re.sub(r'```$', '', text, flags=re.MULTILINE)
+    return text.strip()
+
 def run_multi_agent_pipeline(user_prompt, chat_id, status_id):
-    bot.edit_message_text("🚀 Pipeline Multi-Agents démarré...", chat_id, status_id)
+    bot.edit_message_text("🔍 Phase 1: Recherche & Stratégie...", chat_id, status_id)
+    
+    search_prompt = f"Analyse cette demande: {user_prompt}. Liste les fonctions JS indispensables et le style CSS attendu."
+    research_data = agent_worker("Analyse & Recherche", search_prompt, MODELS["flash"])
+    
+    bot.edit_message_text("💻 Phase 2: Génération des couches...", chat_id, status_id)
     
     tasks = {
-        "Recherche": (f"Cherche des ressources et concepts clés pour : {user_prompt}", MODELS["flash"]),
-        "HTML": (f"Crée la structure HTML5 pour : {user_prompt}", MODELS["pro"]),
-        "CSS": (f"Crée le design CSS moderne pour : {user_prompt}", MODELS["pro"]),
-        "JS": (f"Crée la logique JavaScript pour : {user_prompt}", MODELS["pro"])
+        "HTML": (f"Structure HTML5 propre pour: {user_prompt}", MODELS["pro"]),
+        "CSS": (f"CSS moderne (Tailwind ou CSS pur) pour: {user_prompt}", MODELS["pro"]),
+        "JS": (f"Logique JS complète pour: {user_prompt}", MODELS["pro"])
     }
     
     results = {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_role = {executor.submit(agent_worker, role, t[0], t[1]): role for role, t in tasks.items()}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_to_role = {executor.submit(agent_worker, role, t[0], t[1], research_data): role for role, t in tasks.items()}
         for future in future_to_role:
             role = future_to_role[future]
             results[role] = future.result()
-            bot.edit_message_text(f"✅ Agent {role} terminé...", chat_id, status_id)
+            bot.edit_message_text(f"✅ Agent {role} a fini son travail...", chat_id, status_id)
 
-    bot.edit_message_text("🏗️ Assemblage final par l'agent Ultra...", chat_id, status_id)
+    bot.edit_message_text("🏗️ Phase 3: Fusion & Finalisation...", chat_id, status_id)
     
     assembly_prompt = f"""
-    Assemble ces éléments en un seul fichier HTML complet et fonctionnel :
+    Assemble les composants suivants en un FICHIER UNIQUE HTML.
+    
     HTML: {results.get('HTML')}
     CSS: {results.get('CSS')}
     JS: {results.get('JS')}
-    Infos supp: {results.get('Recherche')}
+    
+    RÈGLES CRITIQUES :
+    1. Ne mets JAMAIS de balises Markdown (```html).
+    2. Insère le CSS dans <style>...</style>.
+    3. Insère le JS dans <script>...</script>.
+    4. Le fichier doit être 100% prêt à l'emploi.
     """
     
-    final_code = call_nvidia_api("Tu es l'assembleur final. Produis un code propre et complet.", [{"role": "user", "content": assembly_prompt}], MODELS["ultra"])
+    final_raw = call_nvidia_api("Tu es l'Assembleur Final. Tu ne réponds QUE par le code brut sans aucun texte autour ni balise Markdown.", [{"role": "user", "content": assembly_prompt}], MODELS["ultra"])
     
-    # Création du fichier téléchargeable
+    # Sécurité supplémentaire au cas où il ignore la consigne du Markdown
+    final_code = clean_markdown(final_raw)
+    
     file_io = io.BytesIO(final_code.encode('utf-8'))
-    file_io.name = "projet_complet.html"
-    bot.send_document(chat_id, file_io, caption="📦 Voici votre projet assemblé et prêt à l'emploi.")
+    file_io.name = "projet_final.html"
+    bot.send_document(chat_id, file_io, caption="✅ Voici votre projet assemblé par l'agent Ultra.")
     bot.delete_message(chat_id, status_id)
 
 def animate_thinking(chat_id, message_id, stop_event):
@@ -178,13 +198,26 @@ def animate_thinking(chat_id, message_id, stop_event):
         try:
             bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=frames[idx % 4])
             idx += 1
-            time.sleep(1)
+            time.sleep(1.2)
         except: break
 
 @bot.message_handler(commands=["start"])
 def handle_start(message: Message):
     if not is_allowed(message.from_user.id): return
-    bot.send_message(message.chat.id, "Assistant Arthur prêt.\nCommandes: /model, /reset")
+    bot.send_message(message.chat.id, "Assistant Arthur prêt.\n/model pour changer de mode.\n/debug pour voir la mémoire.")
+
+@bot.message_handler(commands=["debug"])
+def handle_debug(message: Message):
+    if not is_allowed(message.from_user.id): return
+    mem = get_user_memory(message.from_user.id)
+    debug_text = (
+        f"⚙️ **DEBUG SYSTÈME**\n\n"
+        f"👤 **Utilisateur:** `{message.from_user.id}`\n"
+        f"🤖 **Moteur actif:** `{mem['model']}`\n"
+        f"📊 **Échanges:** `{mem['exchange_count']}`\n"
+        f"📝 **Mémoire Résumée:**\n{mem['summary'] or '_Vide_'}"
+    )
+    bot.send_message(message.chat.id, debug_text, parse_mode="Markdown")
 
 @bot.message_handler(commands=["model"])
 def handle_model_command(message: Message):
@@ -193,8 +226,8 @@ def handle_model_command(message: Message):
     markup.row(InlineKeyboardButton("Léger (8B)", callback_data="setmod:flash"))
     markup.row(InlineKeyboardButton("Équilibré (70B)", callback_data="setmod:pro"))
     markup.row(InlineKeyboardButton("Ultra (405B)", callback_data="setmod:ultra"))
-    markup.row(InlineKeyboardButton("🌟 TRAVAIL MULTIPLE (Pipeline)", callback_data="setmod:multi"))
-    bot.send_message(message.chat.id, "Choisissez le mode de travail :", reply_markup=markup)
+    markup.row(InlineKeyboardButton("🚀 TRAVAIL MULTIPLE (Pipeline)", callback_data="setmod:multi"))
+    bot.send_message(message.chat.id, "Choisis ton moteur :", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("setmod:"))
 def callback_set_model(call):
@@ -221,7 +254,7 @@ def handle_message(message: Message):
     uid, txt = message.from_user.id, message.text.strip()
     mem = get_user_memory(uid)
     
-    status_msg = bot.send_message(message.chat.id, "Initialisation...")
+    status_msg = bot.send_message(message.chat.id, "Analyse...")
     
     if mem["model"] == "multi_agent_system":
         threading.Thread(target=run_multi_agent_pipeline, args=(txt, message.chat.id, status_msg.message_id)).start()
@@ -243,9 +276,9 @@ def handle_message(message: Message):
     except Exception as e:
         stop_event.set()
         if anim.is_alive(): anim.join()
-        log.error(f"Erreur Chat: {str(e)}")
-        bot.edit_message_text(f"Erreur API NVIDIA ({mem['model']})", message.chat.id, status_msg.message_id)
+        log.error(f"Erreur: {str(e)}")
+        bot.edit_message_text(f"Désolé, problème technique. Modèle: {mem['model']}", message.chat.id, status_msg.message_id)
 
 if __name__ == "__main__":
     init_db()
-    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    bot.infinity_polling()
