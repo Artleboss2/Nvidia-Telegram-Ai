@@ -7,6 +7,7 @@ import threading
 import io
 import base64
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 import telebot
 from telebot.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -24,14 +25,14 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-# Mise à jour de l'ID pour correspondre aux formats Meta sur NVIDIA
 VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "meta/llama-3.2-11b-vision-instruct")
 DB_PATH = os.getenv("DB_PATH", "/app/data/memory.db")
 
 MODELS = {
     "flash": "meta/llama-3.1-8b-instruct",
     "pro": "meta/llama-3.1-70b-instruct",
-    "ultra": "meta/llama-3.1-405b-instruct"
+    "ultra": "meta/llama-3.1-405b-instruct",
+    "multi": "multi_agent_system"
 }
 
 raw_ids = os.getenv("ADMIN_USER_ID", "")
@@ -123,10 +124,52 @@ def call_nvidia_api(system_prompt: str, messages: list, model):
         model=model,
         messages=payload,
         temperature=0.6,
-        max_tokens=1024,
-        timeout=60
+        max_tokens=2048,
+        timeout=120
     )
     return res.choices[0].message.content.strip()
+
+def agent_worker(role_name, prompt, model_id):
+    try:
+        return call_nvidia_api(f"Tu es l'expert {role_name}. Réponds uniquement avec le code ou les données demandées.", [{"role": "user", "content": prompt}], model_id)
+    except Exception as e:
+        return f"Erreur {role_name}: {str(e)}"
+
+def run_multi_agent_pipeline(user_prompt, chat_id, status_id):
+    bot.edit_message_text("🚀 Pipeline Multi-Agents démarré...", chat_id, status_id)
+    
+    tasks = {
+        "Recherche": (f"Cherche des ressources et concepts clés pour : {user_prompt}", MODELS["flash"]),
+        "HTML": (f"Crée la structure HTML5 pour : {user_prompt}", MODELS["pro"]),
+        "CSS": (f"Crée le design CSS moderne pour : {user_prompt}", MODELS["pro"]),
+        "JS": (f"Crée la logique JavaScript pour : {user_prompt}", MODELS["pro"])
+    }
+    
+    results = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_role = {executor.submit(agent_worker, role, t[0], t[1]): role for role, t in tasks.items()}
+        for future in future_to_role:
+            role = future_to_role[future]
+            results[role] = future.result()
+            bot.edit_message_text(f"✅ Agent {role} terminé...", chat_id, status_id)
+
+    bot.edit_message_text("🏗️ Assemblage final par l'agent Ultra...", chat_id, status_id)
+    
+    assembly_prompt = f"""
+    Assemble ces éléments en un seul fichier HTML complet et fonctionnel :
+    HTML: {results.get('HTML')}
+    CSS: {results.get('CSS')}
+    JS: {results.get('JS')}
+    Infos supp: {results.get('Recherche')}
+    """
+    
+    final_code = call_nvidia_api("Tu es l'assembleur final. Produis un code propre et complet.", [{"role": "user", "content": assembly_prompt}], MODELS["ultra"])
+    
+    # Création du fichier téléchargeable
+    file_io = io.BytesIO(final_code.encode('utf-8'))
+    file_io.name = "projet_complet.html"
+    bot.send_document(chat_id, file_io, caption="📦 Voici votre projet assemblé et prêt à l'emploi.")
+    bot.delete_message(chat_id, status_id)
 
 def animate_thinking(chat_id, message_id, stop_event):
     frames = ["Réflexion", "Réflexion.", "Réflexion..", "Réflexion..."]
@@ -150,7 +193,8 @@ def handle_model_command(message: Message):
     markup.row(InlineKeyboardButton("Léger (8B)", callback_data="setmod:flash"))
     markup.row(InlineKeyboardButton("Équilibré (70B)", callback_data="setmod:pro"))
     markup.row(InlineKeyboardButton("Ultra (405B)", callback_data="setmod:ultra"))
-    bot.send_message(message.chat.id, "Choisissez la puissance de l'IA :", reply_markup=markup)
+    markup.row(InlineKeyboardButton("🌟 TRAVAIL MULTIPLE (Pipeline)", callback_data="setmod:multi"))
+    bot.send_message(message.chat.id, "Choisissez le mode de travail :", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("setmod:"))
 def callback_set_model(call):
@@ -160,8 +204,8 @@ def callback_set_model(call):
         with get_db() as conn:
             conn.execute("INSERT INTO memory (user_id, current_model) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET current_model=excluded.current_model", (call.from_user.id, new_model))
             conn.commit()
-        bot.answer_callback_query(call.id, "Modèle mis à jour !")
-        bot.edit_message_text(f"Modèle actif : {key.upper()}", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        bot.answer_callback_query(call.id, f"Mode {key.upper()} activé !")
+        bot.edit_message_text(f"Mode actif : {key.upper()}", chat_id=call.message.chat.id, message_id=call.message.message_id)
 
 @bot.message_handler(commands=["reset"])
 def handle_reset(message: Message):
@@ -171,62 +215,22 @@ def handle_reset(message: Message):
         conn.commit()
     bot.send_message(message.chat.id, "Mémoire réinitialisée.")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("retry:"))
-def handle_retry(call):
-    retry_id = call.data.split(":")[1]
-    with get_db() as conn:
-        row = conn.execute("SELECT text FROM retry_cache WHERE msg_id = ?", (retry_id,)).fetchone()
-    if row:
-        try: bot.delete_message(call.message.chat.id, call.message.message_id)
-        except: pass
-        call.message.text = row["text"]
-        call.message.from_user.id = call.from_user.id
-        handle_message(call.message)
-
-@bot.message_handler(content_types=["document", "photo", "voice", "audio"])
-def handle_files(message: Message):
-    if not is_allowed(message.from_user.id): return
-    if message.document:
-        if not PDF_SUPPORT:
-            bot.reply_to(message, "Analyse PDF désactivée.")
-            return
-        file_info = bot.get_file(message.document.file_id)
-        downloaded = bot.download_file(file_info.file_path)
-        if "pdf" in (message.document.mime_type or ""):
-            try:
-                doc = fitz.open(stream=downloaded, filetype="pdf")
-                text = "".join([p.get_text() for p in doc])
-                doc.close()
-                message.text = f"[Contenu PDF]\n{text[:3000]}"
-                handle_message(message)
-            except: bot.reply_to(message, "Erreur PDF.")
-    elif message.photo:
-        file_info = bot.get_file(message.photo[-1].file_id)
-        downloaded = bot.download_file(file_info.file_path)
-        img = Image.open(io.BytesIO(downloaded))
-        if img.mode != 'RGB': img = img.convert('RGB')
-        output = io.BytesIO()
-        img.save(output, format="JPEG", quality=85)
-        b64 = base64.b64encode(output.getvalue()).decode('utf-8')
-        status = bot.send_message(message.chat.id, "Analyse image...")
-        try:
-            res = call_nvidia_api("Expert Vision", [{"role":"user","content":[{"type":"text","text":"Décris précisément cette image."},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}]}], VISION_MODEL_ID)
-            bot.edit_message_text(res, message.chat.id, status.message_id)
-        except Exception as e:
-            log.error(f"Erreur Vision: {str(e)}")
-            bot.edit_message_text(f"Erreur Vision API (404). ID utilisé: {VISION_MODEL_ID}", message.chat.id, status.message_id)
-    elif message.voice or message.audio:
-        bot.reply_to(message, "Transcription audio non configurée (Whisper requis).")
-
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_message(message: Message):
     if not is_allowed(message.from_user.id): return
     uid, txt = message.from_user.id, message.text.strip()
-    status_msg = bot.send_message(message.chat.id, "Réflexion")
+    mem = get_user_memory(uid)
+    
+    status_msg = bot.send_message(message.chat.id, "Initialisation...")
+    
+    if mem["model"] == "multi_agent_system":
+        threading.Thread(target=run_multi_agent_pipeline, args=(txt, message.chat.id, status_msg.message_id)).start()
+        return
+
     stop_event = threading.Event()
     anim = threading.Thread(target=animate_thinking, args=(message.chat.id, status_msg.message_id, stop_event))
     anim.start()
-    mem = get_user_memory(uid)
+    
     context = mem["last_messages"][-6:] + [{"role": "user", "content": txt}]
     try:
         reply = call_nvidia_api(f"Tu es un assistant utile. Mémoire: {mem['summary']}", context, mem["model"])
@@ -240,13 +244,7 @@ def handle_message(message: Message):
         stop_event.set()
         if anim.is_alive(): anim.join()
         log.error(f"Erreur Chat: {str(e)}")
-        rid = str(int(time.time()))
-        with get_db() as conn:
-            conn.execute("INSERT OR REPLACE INTO retry_cache (msg_id, text) VALUES (?,?)", (rid, txt))
-            conn.commit()
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("Réessayer", callback_data=f"retry:{rid}"))
-        bot.edit_message_text(f"Erreur API NVIDIA. Modèle: {mem['model']}", message.chat.id, status_msg.message_id, reply_markup=markup)
+        bot.edit_message_text(f"Erreur API NVIDIA ({mem['model']})", message.chat.id, status_msg.message_id)
 
 if __name__ == "__main__":
     init_db()
