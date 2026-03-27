@@ -46,7 +46,7 @@ if not TELEGRAM_TOKEN or not NVIDIA_API_KEY:
     exit(1)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-nvidia_client = OpenAI(api_key=NVIDIA_API_KEY, base_url=NVIDIA_BASE_URL, max_retries=1)
+nvidia_client = OpenAI(api_key=NVIDIA_API_KEY, base_url=NVIDIA_BASE_URL, max_retries=5)
 
 @contextmanager
 def get_db():
@@ -69,6 +69,10 @@ def init_db():
                 current_model TEXT DEFAULT 'meta/llama-3.1-8b-instruct'
             )
         """)
+        try:
+            conn.execute("ALTER TABLE memory ADD COLUMN current_model TEXT DEFAULT 'meta/llama-3.1-8b-instruct'")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("CREATE TABLE IF NOT EXISTS retry_cache (msg_id TEXT PRIMARY KEY, text TEXT)")
         conn.commit()
 
@@ -80,6 +84,12 @@ def get_user_memory(user_id: int):
         row = conn.execute("SELECT * FROM memory WHERE user_id = ?", (user_id,)).fetchone()
     if row is None:
         return {"summary": "", "last_messages": [], "exchange_count": 0, "model": MODELS["flash"]}
+    
+    try:
+        model = row["current_model"] if "current_model" in row.keys() else MODELS["flash"]
+    except:
+        model = MODELS["flash"]
+        
     try:
         messages = json.loads(row["last_messages_json"] or "[]")
     except:
@@ -88,7 +98,7 @@ def get_user_memory(user_id: int):
         "summary": row["summary"] or "",
         "last_messages": messages,
         "exchange_count": row["exchange_count"] or 0,
-        "model": row["current_model"] or MODELS["flash"]
+        "model": model or MODELS["flash"]
     }
 
 def save_user_memory(user_id: int, summary: str, last_messages: list, exchange_count: int, model: str = None):
@@ -135,7 +145,7 @@ def handle_start(message: Message):
 def handle_model_command(message: Message):
     if not is_allowed(message.from_user.id): return
     markup = InlineKeyboardMarkup()
-    markup.row(InlineKeyboardButton("Léger (Rapide)", callback_data="setmod:flash"))
+    markup.row(InlineKeyboardButton("Léger (8B)", callback_data="setmod:flash"))
     markup.row(InlineKeyboardButton("Équilibré (70B)", callback_data="setmod:pro"))
     markup.row(InlineKeyboardButton("Ultra (405B)", callback_data="setmod:ultra"))
     bot.send_message(message.chat.id, "Choisissez la puissance de l'IA :", reply_markup=markup)
@@ -176,7 +186,7 @@ def handle_files(message: Message):
     if not is_allowed(message.from_user.id): return
     if message.document:
         if not PDF_SUPPORT:
-            bot.reply_to(message, "L'analyse PDF est désactivée (module manquant).")
+            bot.reply_to(message, "L'analyse PDF est désactivée.")
             return
         file_info = bot.get_file(message.document.file_id)
         downloaded = bot.download_file(file_info.file_path)
@@ -196,7 +206,7 @@ def handle_files(message: Message):
         try:
             res = call_nvidia_api("Expert Vision", [{"role":"user","content":[{"type":"text","text":"Décris l'image"},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}]}], VISION_MODEL_ID)
             bot.edit_message_text(res, message.chat.id, status.message_id)
-        except: bot.edit_message_text("Erreur vision.", message.chat.id, status.message_id)
+        except: bot.edit_message_text("Erreur vision (Modèle 404).", message.chat.id, status.message_id)
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_message(message: Message):
@@ -225,7 +235,7 @@ def handle_message(message: Message):
             conn.commit()
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Réessayer", callback_data=f"retry:{rid}"))
-        bot.edit_message_text("Erreur ou Timeout.", message.chat.id, status_msg.message_id, reply_markup=markup)
+        bot.edit_message_text(f"Erreur API. Vérifiez vos IDs NVIDIA.", message.chat.id, status_msg.message_id, reply_markup=markup)
 
 if __name__ == "__main__":
     init_db()
