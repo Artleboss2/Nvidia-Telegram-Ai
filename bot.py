@@ -24,7 +24,8 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "nvidia/llama-3.2-11b-vision-instruct")
+# Mise à jour de l'ID pour correspondre aux formats Meta sur NVIDIA
+VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "meta/llama-3.2-11b-vision-instruct")
 DB_PATH = os.getenv("DB_PATH", "/app/data/memory.db")
 
 MODELS = {
@@ -211,7 +212,9 @@ def handle_files(message: Message):
         try:
             res = call_nvidia_api("Expert Vision", [{"role":"user","content":[{"type":"text","text":"Décris précisément cette image."},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}]}], VISION_MODEL_ID)
             bot.edit_message_text(res, message.chat.id, status.message_id)
-        except: bot.edit_message_text("Erreur Vision API.", message.chat.id, status.message_id)
+        except Exception as e:
+            log.error(f"Erreur Vision: {str(e)}")
+            bot.edit_message_text(f"Erreur Vision API (404). ID utilisé: {VISION_MODEL_ID}", message.chat.id, status.message_id)
     elif message.voice or message.audio:
         bot.reply_to(message, "Transcription audio non configurée (Whisper requis).")
 
@@ -236,13 +239,14 @@ def handle_message(message: Message):
     except Exception as e:
         stop_event.set()
         if anim.is_alive(): anim.join()
+        log.error(f"Erreur Chat: {str(e)}")
         rid = str(int(time.time()))
         with get_db() as conn:
             conn.execute("INSERT OR REPLACE INTO retry_cache (msg_id, text) VALUES (?,?)", (rid, txt))
             conn.commit()
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Réessayer", callback_data=f"retry:{rid}"))
-        bot.edit_message_text("Erreur API NVIDIA.", message.chat.id, status_msg.message_id, reply_markup=markup)
+        bot.edit_message_text(f"Erreur API NVIDIA. Modèle: {mem['model']}", message.chat.id, status_msg.message_id, reply_markup=markup)
 
 if __name__ == "__main__":
     init_db()
