@@ -1,6 +1,6 @@
 pyTelegramBotAPI
 openai==1.12.0
 httpx==0.26.0
-pymupdf
+pymupdf==4.16.1
 pillow==10.2.0
-requests
+requests==2.31.0
