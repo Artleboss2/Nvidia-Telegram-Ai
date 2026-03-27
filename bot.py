@@ -10,7 +10,12 @@ from contextlib import contextmanager
 from openai import OpenAI
 import telebot
 from telebot.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-import fitz
+
+try:
+    import fitz
+    PDF_SUPPORT = True
+except ImportError:
+    PDF_SUPPORT = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -170,6 +175,9 @@ def handle_retry(call):
 def handle_files(message: Message):
     if not is_allowed(message.from_user.id): return
     if message.document:
+        if not PDF_SUPPORT:
+            bot.reply_to(message, "L'analyse PDF est désactivée (module manquant).")
+            return
         file_info = bot.get_file(message.document.file_id)
         downloaded = bot.download_file(file_info.file_path)
         if "pdf" in (message.document.mime_type or ""):
