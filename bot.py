@@ -20,13 +20,13 @@ log = logging.getLogger(__name__)
 # Récupération des variables d'environnement
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
-HF_TOKEN = os.environ.get("HF_TOKEN") # Clé Hugging Face
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") # Récupéré depuis le .env
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 DB_PATH = os.getenv("DB_PATH", "/app/data/memory.db")
 
 # Vérification des clés essentielles
-if not all([TELEGRAM_TOKEN, NVIDIA_API_KEY, HF_TOKEN]):
-    log.error("Erreur : TELEGRAM_TOKEN, NVIDIA_API_KEY ou HF_TOKEN manquant dans le .env")
+if not all([TELEGRAM_TOKEN, NVIDIA_API_KEY, GEMINI_API_KEY]):
+    log.error("Erreur : TELEGRAM_TOKEN, NVIDIA_API_KEY ou GEMINI_API_KEY manquant dans le .env")
     exit(1)
 
 MODELS = {
@@ -35,9 +35,6 @@ MODELS = {
     "ultra": "meta/llama-3.1-405b-instruct",
     "multi": "multi_agent_system"
 }
-
-# Modèle Hugging Face par défaut pour le codage lourd (ex: Llama 3.3 70B ou Qwen 2.5 72B)
-HF_MODEL_ID = "meta-llama/Llama-3.3-70B-Instruct"
 
 raw_ids = os.getenv("ADMIN_USER_ID", "")
 ALLOWED_IDS = [int(i.strip()) for i in raw_ids.split(",") if i.strip()]
@@ -52,42 +49,28 @@ ensure_data_dir()
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 nvidia_client = OpenAI(api_key=NVIDIA_API_KEY, base_url=NVIDIA_BASE_URL)
 
-# --- UTILS API HUGGING FACE ---
+# --- UTILS API ---
 
-def call_huggingface_api(prompt, system_instruction=""):
-    """Appel à l'API Hugging Face pour la génération de code."""
-    url = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    
-    # Formatage du prompt pour Llama 3 (Chat Template)
-    formatted_prompt = f"<|system|>\n{system_instruction}<|end|>\n<|user|>\n{prompt}<|end|>\n<|assistant|>"
-    
+def call_gemini_api(prompt, system_instruction=""):
+    """Appel à Gemini 2.5 Flash pour une génération de code massive."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={GEMINI_API_KEY}"
     payload = {
-        "inputs": formatted_prompt,
-        "parameters": {
-            "max_new_tokens": 2048,
-            "temperature": 0.3,
-            "return_full_text": False
-        }
+        "contents": [{"parts": [{"text": prompt}]}],
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "tools": [{"google_search": {}}]
     }
     
-    for i in [1, 2, 4, 8]:
+    # Logique de tentative avec repli exponentiel
+    for i in [1, 2, 4, 8, 16]:
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=120)
+            response = requests.post(url, json=payload, timeout=120)
             if response.status_code == 200:
                 result = response.json()
-                # Selon le modèle, la structure de réponse peut varier légèrement
-                if isinstance(result, list):
-                    return result[0].get('generated_text', "").strip()
-                return result.get('generated_text', "").strip()
-            elif response.status_code == 503: # Modèle en cours de chargement
-                log.info("Hugging Face : Modèle en cours de chargement...")
-                time.sleep(20)
-                continue
+                return result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', "")
         except Exception as e:
-            log.warning(f"Tentative Hugging Face échouée : {e}")
+            log.warning(f"Tentative Gemini échouée : {e}")
         time.sleep(i)
-    return "Erreur de génération Hugging Face après plusieurs tentatives."
+    return "Erreur de génération Gemini après plusieurs tentatives."
 
 def call_nvidia_api(system_prompt, messages, model):
     payload = [{"role": "system", "content": system_prompt}] + messages
@@ -156,36 +139,35 @@ def save_user_memory(user_id: int, summary: str, last_messages: list, exchange_c
 def run_multi_agent_pipeline(user_prompt, chat_id, status_id):
     target_repo = "https://github.com/ArthurPujat/TelegramAI"
     
-    bot.edit_message_text("🔍 Phase 1: Analyse stratégique (Hugging Face)...", chat_id, status_id)
+    bot.edit_message_text("🔍 Phase 1: Exploration profonde du Repo (Gemini Search)...", chat_id, status_id)
     
-    research_prompt = f"Analyse le dépôt {target_repo} et la demande : {user_prompt}. Liste les besoins techniques."
-    research_data = call_huggingface_api(research_prompt, "Tu es un ingénieur de recherche spécialisé en code.")
+    research_prompt = f"Explore le dépôt {target_repo} et analyse la demande : {user_prompt}. Liste les fichiers et les dépendances."
+    research_data = call_gemini_api(research_prompt, "Tu es un ingénieur de recherche senior spécialisé en analyse de code source.")
     
-    bot.edit_message_text("💻 Phase 2: Codage des modules (Hugging Face)...", chat_id, status_id)
+    bot.edit_message_text("💻 Phase 2: Codage intensif des modules (Gemini Core)...", chat_id, status_id)
     
     tasks = {
-        "HTML": f"Génère un fichier HTML5 complet pour {user_prompt}. Sois très précis. Minimum 150 lignes.",
-        "CSS": f"Génère un design CSS moderne pour {user_prompt}. Sois créatif. Minimum 200 lignes.",
-        "JS": f"Développe toute la logique JavaScript pour {user_prompt}. Minimum 250 lignes."
+        "HTML": f"Génère un fichier HTML5 complet pour {user_prompt}. Minimum 200 lignes.",
+        "CSS": f"Génère un design CSS moderne pour {user_prompt}. Minimum 300 lignes.",
+        "JS": f"Développe toute la logique JavaScript pour {user_prompt}. Minimum 400 lignes."
     }
     
     results = {}
     for role, prompt in tasks.items():
-        bot.edit_message_text(f"🛠️ Agent {role} en cours de génération...", chat_id, status_id)
-        results[role] = call_huggingface_api(prompt, f"Tu es l'expert {role}. Produis un code robuste.")
+        bot.edit_message_text(f"🛠️ Agent {role} en cours de rédaction massive...", chat_id, status_id)
+        results[role] = call_gemini_api(prompt, f"Tu es l'expert {role}. Produis un code très détaillé.")
 
-    bot.edit_message_text("🏗️ Phase 3: Assemblage final (NVIDIA Ultra)...", chat_id, status_id)
+    bot.edit_message_text("🏗️ Phase 3: Assemblage & Certification (NVIDIA Ultra)...", chat_id, status_id)
     
-    assembly_prompt = f"Fusionne ces modules en un seul fichier .html.\nHTML: {results.get('HTML')}\nCSS: {results.get('CSS')}\nJS: {results.get('JS')}"
+    assembly_prompt = f"Fusionne ces modules en un seul fichier .html fonctionnel.\nHTML: {results.get('HTML')}\nCSS: {results.get('CSS')}\nJS: {results.get('JS')}"
     final_raw = call_nvidia_api("Tu es l'Assembleur Final. Réponds uniquement par le code source pur.", [{"role": "user", "content": assembly_prompt}], MODELS["ultra"])
     
-    # Nettoyage Markdown
     final_code = re.sub(r'^```[a-z]*\n', '', final_raw, flags=re.MULTILINE)
     final_code = re.sub(r'```$', '', final_code, flags=re.MULTILINE).strip()
     
     file_io = io.BytesIO(final_code.encode('utf-8'))
-    file_io.name = "projet_hf.html"
-    bot.send_document(chat_id, file_io, caption=f"✅ Généré via Hugging Face & NVIDIA ({len(final_code)//1024}kb).")
+    file_io.name = "application_massive.html"
+    bot.send_document(chat_id, file_io, caption=f"✅ Projet de {len(final_code)//1024}kb généré.")
     bot.delete_message(chat_id, status_id)
 
 # --- HANDLERS ---
@@ -196,20 +178,26 @@ def is_allowed(user_id: int):
 @bot.message_handler(commands=["start"])
 def handle_start(message: Message):
     if not is_allowed(message.from_user.id): return
-    bot.send_message(message.chat.id, "Arthur opérationnel avec Hugging Face.\nUtilisez /model pour tester le pipeline.")
+    bot.send_message(message.chat.id, "Arthur Pro prêt. Utilisez /model pour le mode Multi-Agent.")
 
 @bot.message_handler(commands=["debug"])
 def handle_debug(message: Message):
+    """Affiche une carte d'identité visuelle de l'utilisateur et de l'état du bot."""
     if not is_allowed(message.from_user.id): return
     mem = get_user_memory(message.from_user.id)
+    
+    # Construction de la "Carte d'identité"
     card = (
         "┏━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
-        "┃    🆔 **CARTE ARTHUR HF** ┃\n"
+        "┃    🆔 **CARTE D'IDENTITÉ ARTHUR** ┃\n"
         "┠──────────────────────────┨\n"
         f"┃ 👤 **USER:** `{message.from_user.first_name}`\n"
         f"┃ 🔢 **ID:** `{message.from_user.id}`\n"
         f"┃ 🤖 **MODÈLE:** `{mem['model'].split('/')[-1]}`\n"
-        f"┃ 🛠️ **ENGINE:** `Hugging Face` \n"
+        f"┃ 📊 **ÉCHANGES:** `{mem['exchange_count']}`\n"
+        "┠──────────────────────────┨\n"
+        "┃ 🧠 **MÉMOIRE RÉSUMÉE:**\n"
+        f"┃ {mem['summary'][:150] + '...' if mem['summary'] else 'Vide'}\n"
         "┗━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
     )
     bot.send_message(message.chat.id, card, parse_mode="Markdown")
@@ -218,9 +206,9 @@ def handle_debug(message: Message):
 def handle_model_command(message: Message):
     if not is_allowed(message.from_user.id): return
     markup = InlineKeyboardMarkup()
-    markup.row(InlineKeyboardButton("🚀 PIPELINE HF (Massif)", callback_data="setmod:multi"))
-    markup.row(InlineKeyboardButton("Léger (NVIDIA)", callback_data="setmod:flash"))
-    markup.row(InlineKeyboardButton("Ultra (NVIDIA)", callback_data="setmod:ultra"))
+    markup.row(InlineKeyboardButton("Léger", callback_data="setmod:flash"))
+    markup.row(InlineKeyboardButton("Ultra", callback_data="setmod:ultra"))
+    markup.row(InlineKeyboardButton("🚀 PIPELINE GEMINI (Massif)", callback_data="setmod:multi"))
     bot.send_message(message.chat.id, "Moteur de génération :", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("setmod:"))
@@ -228,7 +216,7 @@ def callback_set_model(call):
     key = call.data.split(":")[1]
     new_model = MODELS.get(key, MODELS["flash"]) if key != "multi" else "multi_agent_system"
     save_user_memory(call.from_user.id, "", [], 0, new_model)
-    bot.answer_callback_query(call.id, f"Moteur {key.upper()} activé !")
+    bot.answer_callback_query(call.id, f"Modèle {key.upper()} activé !")
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_message(message: Message):
@@ -245,7 +233,7 @@ def handle_message(message: Message):
             res = call_nvidia_api("Tu es Arthur, assistant IA.", [{"role": "user", "content": txt}], mem["model"])
             bot.edit_message_text(res, message.chat.id, status_msg.message_id)
         except:
-            bot.edit_message_text("Erreur API NVIDIA.", message.chat.id, status_msg.message_id)
+            bot.edit_message_text("Erreur API.", message.chat.id, status_msg.message_id)
 
 if __name__ == "__main__":
     init_db()
